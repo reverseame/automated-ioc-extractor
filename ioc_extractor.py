@@ -1,7 +1,7 @@
+#!/usr/bin/env python3
 import shlex
 import requests
 import time
-#!/usr/bin/env python
 import argparse
 import subprocess
 import os
@@ -9,28 +9,30 @@ import sys
 import hashlib
 import re
 import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import configparser
-import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 from prettytable import PrettyTable
 import sqlite3
 
+# Importamos el Motor de Unificacion de IoCs
+from utils.report_unifier import IOCReportUnifier
+
 config = configparser.ConfigParser()
 config.optionxform = str
 config.read('tools.ini')
 
-# Variables globales para Docker (IaC)
+# Global Docker configuration variables (IaC)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOCKER_IMAGE_FASE1 = "fase1-estatico:latest"
-DOCKER_IMAGE_FASE3 = "fase3-forense:latest"
+DOCKER_IMAGE_FASE1 = "static-analysis:latest"
+DOCKER_IMAGE_FASE3 = "memory-forensics:latest"
 
 # -------------------------
 # Phase 1: Static Analysis
 # -------------------------
 def run_tool(command, output_file=None, output_folder=None):
-    """Ejecución clásica local (para tools no dockerizadas como strings o curl)"""
     print(f"Executing local command: {command}")
     result = subprocess.run(shlex.split(command) if isinstance(command, str) else command, capture_output=True, text=True)
     if output_file and output_folder:
@@ -40,33 +42,27 @@ def run_tool(command, output_file=None, output_folder=None):
     return result.stdout
 
 def run_tool_docker_phase1(cmd_inside_container, file_path, output_folder, output_file=None):
-    """Envoltorio centralizado para ejecutar herramientas estáticas en Docker"""
     input_dir = os.path.dirname(os.path.abspath(file_path))
     filename = os.path.basename(file_path)
     out_dir = os.path.abspath(output_folder)
-    
+
     os.makedirs(out_dir, exist_ok=True)
-    # TRUCO DEVOPS: Evitar problemas de Rootless Docker dando permisos temporales al directorio
-    os.chmod(out_dir, 0o777) 
-    
+    os.chmod(out_dir, 0o777)
+
     docker_cmd = (
         f"MALWARE_INPUT_DIR='{input_dir}' "
         f"ANALYSIS_OUTPUT_DIR='{out_dir}' "
-        f"docker compose run --rm fase1-estatico "
+        f"docker compose run --rm static-analysis "
         f"{cmd_inside_container.format(input_file='/input/' + filename)}"
     )
     print(f"Executing compose: {docker_cmd}")
-    
-    # TRUCO DEVOPS: Rootless Docker UID 999 para que no falle por SSH
-    import os
+
     os.environ["XDG_RUNTIME_DIR"] = "/run/user/999"
     os.environ["DOCKER_HOST"] = "unix:///run/user/999/docker.sock"
-    
-    # shlex.split() elimina la vulnerabilidad de inyección de comandos al no usar shell=True
+
     print(f"Executing compose seguro: {docker_cmd}")
     result = subprocess.run(shlex.split(docker_cmd), capture_output=True, text=True)
 
-    
     if output_file:
         output_path = os.path.join(output_folder, output_file)
         with open(output_path, 'w') as f:
@@ -81,24 +77,18 @@ def avclass(file_path, output_folder, api_key):
     sha256 = sha256_hash.hexdigest()
     vt_command = f"curl -s https://www.virustotal.com/api/v3/files/{sha256} --header 'X-Apikey: {api_key}'"
     run_tool(vt_command, output_file='virustotal_result.txt', output_folder=output_folder)
-    
+
     out_dir = os.path.abspath(output_folder)
     os.chmod(out_dir, 0o777)
-    
-    # AVClass lee el json descargado previamente usando Compose
-    docker_cmd = f"ANALYSIS_OUTPUT_DIR='{out_dir}' docker compose run --rm fase1-estatico avclass -f /output/virustotal_result.txt"
+
+    docker_cmd = f"ANALYSIS_OUTPUT_DIR='{out_dir}' docker compose run --rm static-analysis avclass -f /output/virustotal_result.txt"
     print(f"Executing compose: {docker_cmd}")
-    
-    # TRUCO DEVOPS: Rootless Docker UID 999 para que no falle por SSH
-    import os
+
     os.environ["XDG_RUNTIME_DIR"] = "/run/user/999"
     os.environ["DOCKER_HOST"] = "unix:///run/user/999/docker.sock"
-    
-    # shlex.split() elimina la vulnerabilidad de inyección de comandos al no usar shell=True
-    print(f"Executing compose seguro: {docker_cmd}")
+
     result = subprocess.run(shlex.split(docker_cmd), capture_output=True, text=True)
 
-    
     output_path = os.path.join(output_folder, 'avclass_result.txt')
     with open(output_path, 'w') as f:
         f.write(result.stdout)
@@ -171,7 +161,7 @@ def phase1(file_path, args, output_folder):
         for tool_name in tools_to_run:
             if tool_name == 'avclass':
                 if not args.vt_api_key:
-                    print("avclass: VirusTotal API key is required.")
+                    print("avclass: VirusTotal API key is required. Skipping.")
                     continue
                 futures[executor.submit(avclass, file_path, output_folder, args.vt_api_key)] = tool_name
             else:
@@ -322,6 +312,12 @@ def phase2(file_path, output_folder):
     os.makedirs(output_folder, exist_ok=True)
     extract_results(data, output_folder)
 
+    # NUEVO: Copiar el report maestro de CAPE para la Unificación
+    try:
+        shutil.copy(report_path, os.path.join(output_folder, "cape_report.json"))
+    except Exception as e:
+        print(f"Warning: Could not copy CAPE report: {e}")
+
     if os.path.exists(dump_path) and os.path.getsize(dump_path) > 0:
         print("Memory dump received.")
     else:
@@ -331,12 +327,11 @@ def phase2(file_path, output_folder):
     print("=====================================")
     print(f"Dynamic analysis completed. Results are available in {output_folder}")
     print("=====================================")
-    return dump_path
+    return dump_path, data
 
 # -------------------------
 # Phase 3: Memory Forensics
 # -------------------------
-
 def apply_filters(plugin_name, output):
     patterns = {
         "windows.netscan": r"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)",
@@ -350,37 +345,32 @@ def apply_filters(plugin_name, output):
     pattern = patterns.get(plugin_name)
     if not pattern:
         return output
-
     filtered_lines = [line for line in output.splitlines() if re.search(pattern, line, re.IGNORECASE)]
     return '\n'.join(filtered_lines)
 
 def run_volatility(plugin_name, memdump_file, pid=None, extra_args=None, output_folder=None):
-    import os, subprocess, shlex
     dumps_folder = os.path.abspath(f"{output_folder}/dumps")
     os.makedirs(dumps_folder, exist_ok=True)
     os.chmod(dumps_folder, 0o777)
-    
+
     memdump_dir = os.path.dirname(os.path.abspath(memdump_file))
     memdump_filename = os.path.basename(memdump_file)
-    
-    # 1. Inyectamos las variables de entorno de forma nativa a nivel de SO
+
     env = os.environ.copy()
     env["XDG_RUNTIME_DIR"] = "/run/user/999"
     env["DOCKER_HOST"] = "unix:///run/user/999/docker.sock"
     env["MEMDUMPS_DIR"] = memdump_dir
     env["ANALYSIS_OUTPUT_DIR"] = dumps_folder
-    
-    # 2. Comando puro (El entrypoint ya tiene python3 /volatility3/vol.py)
-    cmd = ["docker", "compose", "run", "--rm", "fase3-forense", "-q", "-f", f"/dumps/{memdump_filename}", "-o", "/output", plugin_name]
+
+    cmd = ["docker", "compose", "run", "--rm", "memory-forensics", "-q", "-f", f"/dumps/{memdump_filename}", "-o", "/output", plugin_name]
     if pid:
         cmd.extend(["--pid", str(pid)])
     if extra_args:
         cmd.extend(shlex.split(extra_args))
-        
+
     print(f"Executing Volatility: {shlex.join(cmd)}")
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    
-    # 3. Guardar el resultado real
+
     out_name = f"{plugin_name}_{pid}.txt" if pid else f"{plugin_name}.txt"
     out_path = os.path.join(output_folder, out_name)
     with open(out_path, "w") as f:
@@ -396,40 +386,31 @@ def get_pids(memdump_file):
     memdump_filename = os.path.basename(memdump_file)
 
     def voljson(cmd_suffix):
-        import os, subprocess, shlex, json
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = "/run/user/999"
         env["DOCKER_HOST"] = "unix:///run/user/999/docker.sock"
         env["MEMDUMPS_DIR"] = memdump_dir
-        
-        cmd = ["docker", "compose", "run", "--rm", "fase3-forense", "-q", "-f", f"/dumps/{memdump_filename}", "-r", "json"] + shlex.split(cmd_suffix)
-        
+        cmd = ["docker", "compose", "run", "--rm", "memory-forensics", "-q", "-f", f"/dumps/{memdump_filename}", "-r", "json"] + shlex.split(cmd_suffix)
         r = subprocess.run(cmd, env=env, capture_output=True, text=True)
         out = (r.stdout or "").strip()
-        if not out:
-            return []
-        try:
-            return json.loads(out)
-        except Exception:
-            return []
+        if not out: return []
+        try: return json.loads(out)
+        except Exception: return []
 
     def collect_children(node, acc):
         for c in node.get("__children", []):
             pid = c.get("PID")
-            if pid:
-                acc.add(pid)
+            if pid: acc.add(pid)
             collect_children(c, acc)
 
     try:
         agent_names = {"python.exe", "pythonw.exe", "agent.exe"}
         ps = voljson("windows.pslist.PsList")
-        if not ps:
-            return []
+        if not ps: return []
 
         cand_pids = [p.get("PID") for p in ps if (p.get("ImageFileName") or "").lower() in agent_names]
         cand_pids = [pid for pid in cand_pids if pid]
-        if not cand_pids:
-            return []
+        if not cand_pids: return []
 
         analyzer_pids = []
         for pid in cand_pids:
@@ -441,39 +422,31 @@ def get_pids(memdump_file):
                     break
 
         tree = voljson("windows.pstree.PsTree")
-        if not tree:
-            return []
+        if not tree: return []
 
         def find_by_pid(node, pid):
-            if node.get("PID") == pid:
-                return node
+            if node.get("PID") == pid: return node
             for c in node.get("__children", []):
                 hit = find_by_pid(c, pid)
-                if hit:
-                    return hit
+                if hit: return hit
             return None
 
         pids = set()
-
         if analyzer_pids:
             for apid in analyzer_pids:
                 node = None
                 for root in tree:
                     node = find_by_pid(root, apid)
-                    if node:
-                        break
-                if node:
-                    collect_children(node, pids)
+                    if node: break
+                if node: collect_children(node, pids)
 
         if not pids:
             for pid in cand_pids:
                 node = None
                 for root in tree:
                     node = find_by_pid(root, pid)
-                    if node:
-                        break
-                if node:
-                    collect_children(node, pids)
+                    if node: break
+                if node: collect_children(node, pids)
 
         return sorted(pids)
     except Exception:
@@ -521,7 +494,7 @@ def phase3(memdump_path, args, output_folder):
 
     output_folder = f"{output_folder}/memory"
     os.makedirs(output_folder, exist_ok=True)
-    
+
     with ThreadPoolExecutor() as executor:
         futures = {}
         for plugin in plugins:
@@ -558,7 +531,7 @@ def generate_report(args):
                                 data[key] = value
 
         process_key_value_file(f"{static_dir}/exiftool_result.txt", exclude_keys=["ExifTool Version Number"])
-        
+
         if os.path.exists(f"{static_dir}/md5sum_result.txt"):
             data["MD5 Hash"] = open(f"{static_dir}/md5sum_result.txt").readline().split()[0]
         if os.path.exists(f"{static_dir}/sha256sum_result.txt"):
@@ -671,6 +644,9 @@ def main():
     output_folder = args.output_folder
     os.makedirs(output_folder, exist_ok=True)
 
+    # Iniciar el Unificador Maestro
+    unifier = IOCReportUnifier(sample_name=os.path.basename(file_path))
+
     if not (args.phase1 or args.phase2 or args.phase3):
         args.phase1 = args.phase2 = args.phase3 = True
     if args.report:
@@ -678,10 +654,23 @@ def main():
 
     if args.phase1:
         phase1(file_path, args, output_folder)
+        
+        # Extraer data de Fase 1 para el unificador
+        static_data = {"hashes": {}}
+        md5_path = os.path.join(output_folder, "static", "md5sum_result.txt")
+        sha256_path = os.path.join(output_folder, "static", "sha256sum_result.txt")
+        if os.path.exists(md5_path):
+            with open(md5_path, "r") as f: static_data["hashes"]["md5"] = f.read().split()[0]
+        if os.path.exists(sha256_path):
+            with open(sha256_path, "r") as f: static_data["hashes"]["sha256"] = f.read().split()[0]
+        unifier.parse_static_phase(static_data)
 
     dump_path = None
+    dyn_data = None
     if args.phase2:
-        dump_path = phase2(file_path, output_folder)
+        dump_path, dyn_data = phase2(file_path, output_folder)
+        if dyn_data:
+            unifier.parse_dynamic_phase(dyn_data)
 
     if args.phase2 and args.phase3:
         if dump_path:
@@ -692,9 +681,25 @@ def main():
                 print("Memory dump file is required for Phase 3.")
                 sys.exit(1)
             phase3(args.memdump, args, output_folder)
+            
+    if args.phase3:
+        # Extraer data de Fase 3 para el unificador
+        memory_data = {"windows.netscan": []}
+        mem_dir = os.path.join(output_folder, "memory")
+        if os.path.exists(mem_dir):
+            for f_name in os.listdir(mem_dir):
+                if "windows.netscan" in f_name:
+                    with open(os.path.join(mem_dir, f_name), "r") as f:
+                        memory_data["windows.netscan"].extend(f.readlines())
+        unifier.parse_memory_phase(memory_data)
 
     if (args.phase1 and args.phase2 and args.phase3) or args.report:
         generate_report(args)
+
+    # NUEVO: Guardar reporte unificado al final si se ejecutó un análisis
+    if not args.report:
+        unifier_output = os.path.join(output_folder, "unified_maestro_report.json")
+        unifier.save_report(unifier_output)
 
 if __name__ == "__main__":
     main()
